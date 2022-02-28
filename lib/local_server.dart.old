@@ -1,0 +1,263 @@
+import 'package:flutter/cupertino.dart';
+import 'file_io.dart';
+import 'dart:io';
+import 'dart:convert';
+import 'route.dart';
+
+myHttp(ValueNotifier testText, ValueNotifier counter,
+    {String localurl = '127.0.0.1', int port = 8881}) {
+  http() {
+    print('初始化http');
+    HttpServer.bind(localurl, port).then((HttpServer server) {
+      server.listen((HttpRequest request) async {
+        print('接受到请求');
+        print(request.method);
+        print(request.requestedUri);
+        print(request.uri.host);
+        print(request.uri.path);
+        print(request.uri.queryParameters);
+        print(request.contentLength);
+
+        final response = request.response;
+        response.headers.add("Access-Control-Allow-Headers", "*");
+        response.headers.add("Access-Control-Allow-Origin", "*");
+        response.headers
+            .add("Access-Control-Allow-Methods", "POST,GET,DELETE,PUT,OPTIONS");
+
+        int bodyMaxSize = 1024 * 1024 * 320; //1024*1024=1M
+        if (request.contentLength > bodyMaxSize) {
+          DataMap resText;
+          resText = {
+            "message": "太大了,请切分上传",
+            "code": 200,
+            "length": request.contentLength
+          };
+          response.write(resText);
+          print(resText);
+          return response.close();
+        }
+        print('上传大小: ${request.contentLength} 小于限制大小 ${bodyMaxSize}');
+
+        checkParaExists(List<String> requiredPara) {
+          for (String para in requiredPara) {
+            if (!request.uri.queryParameters.containsKey(para)) {
+              throw Exception('missing <${para}> parameters');
+            }
+          }
+        }
+
+        Opt checkParaBool(List<String> requiredPara) {
+          Opt obj = {};
+          for (String para in requiredPara) {
+            obj[para] = [
+              request.uri.queryParameters.containsKey(para),
+              ['true', 'True'].contains(request.uri.queryParameters[para])
+            ].every((i) => i == true);
+          }
+          return obj;
+        }
+
+        Opt option = checkParaBool([
+          'get-content',
+          'get-size',
+          'get-length',
+          'recursive',
+          'dir-size',
+          'dir-child',
+          'dir-child-num',
+          'merge',
+          'merge-clean-part',
+          'merge-clean-dir',
+        ]);
+
+        Future<DataMap> mypost(String path) async {
+          String pathType;
+          DataMap resText = {
+            "message": "",
+            "code": null,
+            "type": null,
+            "data": null,
+            'separator': Platform.pathSeparator
+          };
+          try {
+            pathType = await checkType(path);
+            resText['type'] = pathType;
+          } on FileSystemException catch (e) {
+            print(e);
+            resText = {
+              ...resText,
+              "message": e.message,
+              "code": 503,
+              "url": request.requestedUri,
+            };
+            return resText;
+          }
+          print(pathType);
+
+          if (request.method == "POST") {
+            String method;
+            try {
+              checkParaExists(['method']);
+              method = request.uri.queryParameters['method']!;
+            } on Exception catch (error) {
+              resText = {
+                ...resText,
+                "message": error,
+                "code": 400,
+              };
+              return resText;
+            }
+            if (method == 'read') {
+              switch (pathType) {
+                case 'file':
+                  final res = await read(path, option);
+                  resText = {
+                    ...resText,
+                    "message": "成功读取文件",
+                    "code": 200,
+                    "data": res
+                  };
+                  break;
+                case 'dir':
+                  final res = await readDir(path, option);
+                  resText = {
+                    ...resText,
+                    "message": "成功读取目录",
+                    "code": 200,
+                    "data": res
+                  };
+                  break;
+                default:
+                  resText = {
+                    ...resText,
+                    "message": "读取失败,目标不存在",
+                    "code": 404,
+                  };
+              }
+            }
+            if (method == 'update') {
+              String? contentType = request.headers.contentType?.value;
+              String content = '';
+              print(contentType);
+              switch (contentType) {
+                case 'text/plain':
+                  break;
+                case 'application/json':
+                  content = await utf8.decoder.bind(request).join();
+                  if (option['merge'] == true) {
+                    try {
+                      DataMap data = await mergeFile(content, option);
+                      resText = {
+                        "message": "合并完毕,文件信息 ${data}",
+                        "code": 200,
+                      };
+                    } on FileSystemException catch (e) {
+                      resText = {
+                        "message": '文件缺失 ${e}',
+                        "code": 500,
+                      };
+                    }
+                    print(resText);
+                  }
+                  return resText;
+                case 'multipart/form-data':
+                  try {
+                    await formData(request);
+                  } on FileSystemException catch (e) {
+                    print(e);
+                    resText = {
+                      "message": "form-data ${e.message}",
+                      "code": 500,
+                    };
+                    return resText;
+                  }
+                  resText = {
+                    "message": "form-data 已写入",
+                    "code": 200,
+                  };
+                  print(resText);
+                  return resText;
+                default:
+              }
+              String data;
+              try {
+                checkParaExists(['data']);
+                data = request.uri.queryParameters['data']!;
+              } on Exception catch (error) {
+                resText = {
+                  ...resText,
+                  "message": error,
+                  "code": 400,
+                };
+                return resText;
+              }
+              switch (pathType) {
+                case 'file':
+                  final res = await write(path, option, data);
+                  resText = {
+                    "message": "成功更新文件......",
+                    "code": 200,
+                    "data": res
+                  };
+                  break;
+                case 'dir':
+                  final data = await readDir(path, option);
+                  resText = {
+                    "message": "目录无法更新",
+                    "errorCode": 501,
+                    "type": pathType,
+                    "data": data
+                  };
+                  break;
+                case 'need-file':
+                  final res = await write(path, option, data);
+                  resText = {
+                    "message": "成功创建文件",
+                    "code": 200,
+                    "type": pathType,
+                    "data": res,
+                  };
+                  break;
+                case 'need-dir':
+                  createDir(path);
+                  resText = {
+                    "message": "成功创建目录并写入",
+                    "code": 200,
+                    "type": pathType,
+                  };
+                  break;
+              }
+            }
+            if (method == 'delete') {
+              switch (pathType) {
+                case 'file':
+                  await remove(path);
+                  resText = {"message": "成功删除文件", "errorCode": 200};
+                  break;
+                case 'dir':
+                  await removeDir(path);
+                  resText = {"message": "成功删除目录", "errorCode": 200};
+                  break;
+                default:
+                  resText = {"message": "目标不存在,删除失败", "errorCode": 404};
+              }
+            }
+          }
+          return resText;
+        }
+
+        DataMap resText;
+        if (request.uri.path == '/') {
+          resText = await mypost('data/config.json');
+        } else {
+          String path = request.uri.path.substring(1);
+          resText = await mypost(path);
+        }
+        response.write(resText);
+        return response.close();
+      });
+    });
+  }
+
+  return http;
+}
